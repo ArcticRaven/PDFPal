@@ -320,11 +320,17 @@ public class DocumentStore
 
         if (all.Length == 0) return "";
 
-        // Wrap multi-word phrases in quotes; add prefix wildcard to single words
+        // Always double-quote every term so FTS5 never interprets content as column
+        // references, operators (OR/NOT/AND), or other special syntax.
+        // "phrase with spaces" → exact phrase match
+        // "singleword"*        → prefix match (quotes + * is valid FTS5 syntax)
         var parts = all.Select(t =>
-            t.Contains(' ')
-                ? $"\"{t.Replace("\"", "")}\""
-                : $"{t.Replace("\"", "")}*");
+        {
+            var escaped = t.Replace("\"", "\"\""); // escape embedded quotes
+            return t.Contains(' ')
+                ? $"\"{escaped}\""    // exact phrase
+                : $"\"{escaped}\"*";  // prefix match
+        });
 
         return string.Join(" OR ", parts);
     }

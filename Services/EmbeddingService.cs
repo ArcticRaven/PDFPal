@@ -43,13 +43,18 @@ public class EmbeddingService
         if (chunks.Count == 0)
             throw new InvalidOperationException("No text could be extracted from this PDF.");
 
-        // 2. Embed each chunk (5 → 95 %)
+        // 2. Embed chunks in batches (5 → 95 %)
+        // Sending all texts in one /api/embed call per batch eliminates per-chunk
+        // HTTP round-trips and model scheduling overhead.
+        const int BatchSize = 32;
         var embeddings = new List<float[]>(chunks.Count);
-        for (var i = 0; i < chunks.Count; i++)
+        for (var i = 0; i < chunks.Count; i += BatchSize)
         {
             ct.ThrowIfCancellationRequested();
-            embeddings.Add(await _ollama.GetEmbeddingAsync(chunks[i].Text, ct));
-            onProgress(5 + (int)((i + 1) / (float)chunks.Count * 90));
+            var batch      = chunks.Skip(i).Take(BatchSize).Select(c => c.Text).ToList();
+            var batchVecs  = await _ollama.GetEmbeddingsBatchAsync(batch, ct);
+            embeddings.AddRange(batchVecs);
+            onProgress(5 + (int)(Math.Min(i + BatchSize, chunks.Count) / (float)chunks.Count * 90));
         }
 
         // 3. Persist chunks + FTS index

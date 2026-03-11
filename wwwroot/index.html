@@ -135,6 +135,7 @@
   /* Model info */
   .sidebar-section #model-info { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
   .model-tag { display: inline-block; margin: 2px 2px 2px 0; padding: 2px 6px; border: 1px solid var(--border-hi); border-radius: 3px; font-size: 10px; color: var(--text); }
+  .model-tag.active-model { border-color: var(--accent); color: var(--accent); }
 
   /* ── Chat panel ── */
   main { display: flex; flex-direction: column; overflow: hidden; background: var(--bg); border-right: 1px solid var(--border); }
@@ -437,10 +438,15 @@ async function pollStatus() {
     const dot  = document.getElementById('ollama-dot');
     const lbl  = document.getElementById('ollama-label');
     dot.className     = data.ollamaReady ? 'dot ok' : 'dot warn';
-    lbl.textContent   = data.ollamaReady ? 'ollama ready' : 'ollama connecting…';
+    lbl.textContent   = data.ollamaReady
+      ? `ollama · ${data.activeModel ?? 'unknown'}`
+      : 'ollama connecting…';
     const mi = document.getElementById('model-info');
     mi.innerHTML = data.models?.length
-      ? data.models.map(m => `<span class="model-tag">${m}</span>`).join('')
+      ? data.models.map(m => {
+          const active = m === data.activeModel || (data.activeModel && m.startsWith(data.activeModel));
+          return `<span class="model-tag${active ? ' active-model' : ''}">${m}</span>`;
+        }).join('')
       : '<span style="color:var(--text-dim);font-size:11px">No models found</span>';
   } catch {
     document.getElementById('ollama-dot').className = 'dot err';

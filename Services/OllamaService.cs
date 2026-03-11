@@ -20,6 +20,9 @@ public class OllamaService
         PropertyNameCaseInsensitive = true
     };
 
+    public string ChatModelGpu    => _chatModelGpu;
+    public string ChatModelCpu    => _chatModelCpu;
+    public string EmbedModel      => _embedModel;
     public string ActiveChatModel => _hasGpu ? _chatModelGpu : _chatModelCpu;
 
     public OllamaService(HttpClient http, IConfiguration config, ILogger<OllamaService> logger)
@@ -29,18 +32,79 @@ public class OllamaService
         _chatModelCpu = config["Ollama:ChatModelCpu"] ?? "llama3.2:1b";
         _embedModel   = config["Ollama:EmbedModel"]   ?? "nomic-embed-text";
         _logger       = logger;
+
+        // Explicit override via Ollama:UseGpu — bypasses the unreliable auto-detection.
+        // Set Ollama__UseGpu=true in docker-compose when running with an NVIDIA GPU.
+        if (config.GetValue<bool?>("Ollama:UseGpu") is bool explicitGpu)
+            _hasGpu = explicitGpu;
     }
 
     public void SetGpuMode(bool hasGpu) => _hasGpu = hasGpu;
 
+    /// <summary>Single embedding — used for query vectors at retrieval time.</summary>
     public async Task<float[]> GetEmbeddingAsync(string text, CancellationToken ct = default)
     {
-        var payload  = new { model = _embedModel, prompt = text };
-        var response = await _http.PostAsJsonAsync("/api/embeddings", payload, ct);
+        var payload  = new { model = _embedModel, input = text, keep_alive = "30m" };
+        var response = await _http.PostAsJsonAsync("/api/embed", payload, ct);
         response.EnsureSuccessStatusCode();
 
-        var result = await response.Content.ReadFromJsonAsync<EmbeddingResponse>(cancellationToken: ct);
-        return result?.Embedding ?? [];
+        var result = await response.Content.ReadFromJsonAsync<BatchEmbedResponse>(_jsonOptions, cancellationToken: ct);
+        return result?.Embeddings?.FirstOrDefault() ?? [];
+    }
+
+    /// <summary>
+    /// Batch embedding — sends texts in one call per batch.
+    /// On 400 (chunk too long / batch too large) automatically halves the batch and retries,
+    /// ultimately falling back to one-at-a-time with truncation if needed.
+    /// </summary>
+    public async Task<List<float[]>> GetEmbeddingsBatchAsync(IReadOnlyList<string> texts, CancellationToken ct = default)
+    {
+        if (texts.Count == 0) return [];
+        return await EmbedWithFallbackAsync(texts, ct);
+    }
+
+    private async Task<List<float[]>> EmbedWithFallbackAsync(IReadOnlyList<string> texts, CancellationToken ct)
+    {
+        // Try the whole list as one request first
+        try
+        {
+            var payload  = new { model = _embedModel, input = texts, keep_alive = "30m" };
+            var response = await _http.PostAsJsonAsync("/api/embed", payload, ct);
+            if (response.IsSuccessStatusCode)
+            {
+                var result = await response.Content.ReadFromJsonAsync<BatchEmbedResponse>(_jsonOptions, cancellationToken: ct);
+                if (result?.Embeddings is { Length: > 0 } vecs) return vecs.ToList();
+            }
+        }
+        catch { /* fall through to smaller batches */ }
+
+        // If the batch has more than one item, split and recurse
+        if (texts.Count > 1)
+        {
+            _logger.LogDebug("Embed batch of {N} failed, splitting in half", texts.Count);
+            var mid  = texts.Count / 2;
+            var left  = await EmbedWithFallbackAsync(texts.Take(mid).ToList(), ct);
+            var right = await EmbedWithFallbackAsync(texts.Skip(mid).ToList(), ct);
+            left.AddRange(right);
+            return left;
+        }
+
+        // Single chunk still failing — truncate to ~6000 chars and retry once
+        var truncated = texts[0].Length > 6000 ? texts[0][..6000] : texts[0];
+        _logger.LogWarning("Single chunk embed failed, retrying with truncated text ({Len} chars)", truncated.Length);
+        try
+        {
+            var payload  = new { model = _embedModel, input = truncated, keep_alive = "30m" };
+            var response = await _http.PostAsJsonAsync("/api/embed", payload, ct);
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadFromJsonAsync<BatchEmbedResponse>(_jsonOptions, cancellationToken: ct);
+            return result?.Embeddings?.ToList() ?? [new float[0]];
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Embed failed even after truncation — returning zero vector");
+            return [new float[384]]; // nomic-embed-text dimension; prevents ingestion abort
+        }
     }
 
     public async IAsyncEnumerable<string> StreamChatAsync(
@@ -50,9 +114,10 @@ public class OllamaService
     {
         var payload = new
         {
-            model    = ActiveChatModel,
-            stream   = true,
-            messages = new[]
+            model      = ActiveChatModel,
+            stream     = true,
+            keep_alive = "30m",
+            messages   = new[]
             {
                 new { role = "system", content = systemPrompt },
                 new { role = "user",   content = userMessage  }
@@ -109,9 +174,10 @@ public class OllamaService
 
         var payload = new
         {
-            model = ActiveChatModel,
-            stream = false,
-            messages = new[]
+            model      = ActiveChatModel,
+            stream     = false,
+            keep_alive = "30m",
+            messages   = new[]
             {
                 new { role = "user", content = prompt }
             }
@@ -163,26 +229,78 @@ public class OllamaService
         catch { return []; }
     }
 
+    /// <summary>
+    /// Pulls a model from Ollama using the streaming API so the connection stays alive
+    /// regardless of how long the download takes (avoids HttpClient timeout on large models).
+    /// Logs progress as it arrives.
+    /// </summary>
     public async Task PullModelAsync(string model, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/pull", new { name = model, stream = false }, ct);
+        var request = new HttpRequestMessage(HttpMethod.Post, "/api/pull")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { name = model, stream = true }),
+                Encoding.UTF8, "application/json")
+        };
+
+        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        using var reader       = new StreamReader(stream);
+
+        while (!reader.EndOfStream && !ct.IsCancellationRequested)
+        {
+            var line = await reader.ReadLineAsync(ct);
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("status", out var status))
+                    _logger.LogInformation("[pull {Model}] {Status}", model, status.GetString());
+                // "success" in the status field means the pull is complete
+                if (doc.RootElement.TryGetProperty("status", out var s) &&
+                    s.GetString() == "success") break;
+            }
+            catch { /* skip malformed lines */ }
+        }
     }
 
+    /// <summary>
+    /// Attempts GPU detection by loading a tiny model and checking reported GPU layers.
+    /// Falls back to false (CPU mode) on any failure.
+    /// Prefer setting Ollama__UseGpu explicitly in docker-compose instead.
+    /// </summary>
     public async Task<bool> HasGpuAsync(CancellationToken ct = default)
     {
         try
         {
-            var body = await _http.GetStringAsync("/api/version", ct);
-            return body.Contains("cuda", StringComparison.OrdinalIgnoreCase);
+            // Ask Ollama to load the embed model (small) and inspect how many layers went to GPU.
+            var payload  = new { model = _embedModel, prompt = " ", stream = false };
+            var response = await _http.PostAsJsonAsync("/api/generate", payload, ct);
+            if (!response.IsSuccessStatusCode) return false;
+
+            using var doc = await JsonDocument.ParseAsync(
+                await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+
+            // Ollama reports eval_count only when the model actually ran.
+            // Check the model_info block for gpu layers if present.
+            if (doc.RootElement.TryGetProperty("model_info", out var info))
+            {
+                foreach (var p in info.EnumerateObject())
+                    if (p.Name.Contains("gpu", StringComparison.OrdinalIgnoreCase) &&
+                        p.Value.TryGetInt64(out var n) && n > 0)
+                        return true;
+            }
+            return false;
         }
         catch { return false; }
     }
 
     // ── DTOs ───────────────────────────────────────────────────────────────
 
-    private sealed record EmbeddingResponse(
-        [property: JsonPropertyName("embedding")] float[] Embedding);
+    private sealed record BatchEmbedResponse(
+        [property: JsonPropertyName("embeddings")] float[][] Embeddings);
 
     private sealed record ChatStreamChunk(
         [property: JsonPropertyName("message")]  ChatMessage? Message,

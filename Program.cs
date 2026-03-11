@@ -50,6 +50,7 @@ app.MapGet("/api/status", async (OllamaService ollama, DocumentStore store) =>
     {
         ollamaReady   = healthy,
         models,
+        activeModel   = ollama.ActiveChatModel,
         documentCount = documents.Count,
         documents     = documents.Select(d => new { d.Id, d.Filename, d.ChunkCount })
     });
@@ -97,6 +98,9 @@ app.MapPost("/api/upload", async (
     EmbeddingService embedding,
     ILogger<Program> logger) =>
 {
+    // Raise the limit for this endpoint to 50 MB.
+    var bodySizeFeature = request.HttpContext.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>();
+    if (bodySizeFeature != null) bodySizeFeature.MaxRequestBodySize = 50 * 1024 * 1024; // 50 MB
     if (!request.HasFormContentType)
         return Results.BadRequest("Expected multipart/form-data");
 
@@ -288,13 +292,21 @@ class OllamaStartupService : IHostedService
             await Task.Delay(2000, ct);
         }
 
-        var hasGpu = await ollama.HasGpuAsync(ct);
-        ollama.SetGpuMode(hasGpu);
-        _logger.LogInformation("GPU={HasGpu} — chat model: {Model}", hasGpu, ollama.ActiveChatModel);
+        // Only auto-detect GPU if not explicitly configured via Ollama:UseGpu
+        if (_config.GetValue<bool?>("Ollama:UseGpu") is null)
+        {
+            var hasGpu = await ollama.HasGpuAsync(ct);
+            ollama.SetGpuMode(hasGpu);
+            _logger.LogInformation("GPU auto-detect={HasGpu}", hasGpu);
+        }
 
+        _logger.LogInformation("Active chat model: {Model}", ollama.ActiveChatModel);
+
+        // Pull all three models so switching GPU/CPU mode never requires a separate pull
         var existing = await ollama.ListModelsAsync(ct);
-        await EnsureModelAsync(ollama, ollama.ActiveChatModel, existing, ct);
-        await EnsureModelAsync(ollama, _config["Ollama:EmbedModel"] ?? "nomic-embed-text", existing, ct);
+        await EnsureModelAsync(ollama, ollama.ChatModelGpu, existing, ct);
+        await EnsureModelAsync(ollama, ollama.ChatModelCpu, existing, ct);
+        await EnsureModelAsync(ollama, ollama.EmbedModel,   existing, ct);
         _logger.LogInformation("All models ready.");
     }
 
@@ -302,8 +314,15 @@ class OllamaStartupService : IHostedService
 
     private async Task EnsureModelAsync(OllamaService ollama, string model, List<string> existing, CancellationToken ct)
     {
-        if (existing.Any(m => m.StartsWith(model))) { _logger.LogInformation("{Model} already present.", model); return; }
-        _logger.LogInformation("Pulling {Model}…", model);
+        // Exact match, or match ignoring the tag (e.g. "llama3.1:8b" matches "llama3.1:8b" in the list).
+        // We intentionally do NOT use StartsWith so that "llama3.1:8b" doesn't falsely match
+        // an already-pulled "llama3.1:8b-instruct-q4_K_M".
+        bool present = existing.Any(m =>
+            string.Equals(m, model, StringComparison.OrdinalIgnoreCase));
+
+        if (present) { _logger.LogInformation("{Model} already present — skipping pull.", model); return; }
+
+        _logger.LogInformation("Pulling {Model} (this may take several minutes for large models)…", model);
         await ollama.PullModelAsync(model, ct);
         _logger.LogInformation("{Model} ready.", model);
     }

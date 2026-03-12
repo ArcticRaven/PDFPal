@@ -10,10 +10,15 @@ public sealed record TextChunk(int PageNumber, int ChunkIndex, string Text, floa
 
 public class PdfService
 {
-    // Maximum words before a chunk is forcibly split
-    private const int MaxWords = 500;
+    // Maximum words before a chunk is forcibly split.
+    // Kept low because technical text (tables, measurements, formulas) tokenizes at
+    // 2-3 tokens per character, so 500 words can easily exceed nomic-embed-text's
+    // 8192-token context window. 200 words ≈ ~1200 chars ≈ safe for any model.
+    private const int MaxWords  = 200;
+    // Hard character cap as a safety net for very short but dense words (e.g. tables)
+    private const int MaxChars  = 1500;
     // Don't emit near-empty chunks (e.g. lone headers)
-    private const int MinWords = 15;
+    private const int MinWords  = 10;
 
     public List<TextChunk> ExtractChunks(Stream pdfStream)
     {
@@ -71,8 +76,10 @@ public class PdfService
             var paragraphBreak = i > 0 &&
                 (lines[i - 1].YBottom - line.YTop) > line.Height * 1.5f;
 
-            if (paragraphBreak && words.Count >= MaxWords / 2) Flush();
-            if (words.Count + lineWords.Length > MaxWords)     Flush();
+            var currentChars = words.Sum(w => w.Length + 1);
+            if (paragraphBreak && words.Count >= MaxWords / 2)              Flush();
+            if (words.Count + lineWords.Length > MaxWords)                  Flush();
+            if (currentChars + line.Text.Length > MaxChars && words.Count > 0) Flush();
 
             if (words.Count == 0)
             {

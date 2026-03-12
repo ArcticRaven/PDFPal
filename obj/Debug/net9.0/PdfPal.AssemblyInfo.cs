@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PdfPal")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+660b78534e67ce55f053409b146d65b129f03298")]
 [assembly: System.Reflection.AssemblyProductAttribute("PdfPal")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PdfPal")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

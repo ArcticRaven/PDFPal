@@ -99,11 +99,13 @@ public class DocumentStore
                 text        TEXT,
                 embedding   BLOB,
                 y_start     REAL    DEFAULT 0,
-                y_end       REAL    DEFAULT 1
+                y_end       REAL    DEFAULT 1,
+                tags        TEXT    DEFAULT ''
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 text,
+                tags,
                 content = 'chunks',
                 content_rowid = 'id'
             );
@@ -113,7 +115,12 @@ public class DocumentStore
 
     // ── Write ──────────────────────────────────────────────────────────────
 
-    public async Task<long> AddDocumentAsync(string filename, List<TextChunk> chunks, List<float[]> embeddings)
+    /// <param name="chunkTags">NLP-extracted tags per chunk (same order as chunks).</param>
+    public async Task<long> AddDocumentAsync(
+        string        filename,
+        List<TextChunk> chunks,
+        List<float[]> embeddings,
+        List<string>  chunkTags)
     {
         using var conn = Open();
         using var tx   = conn.BeginTransaction();
@@ -135,13 +142,15 @@ public class DocumentStore
 
         for (var i = 0; i < chunks.Count; i++)
         {
+            var tags = i < chunkTags.Count ? chunkTags[i] : "";
+
             long chunkId;
             using (var cmd = conn.CreateCommand())
             {
                 cmd.Transaction = tx;
                 cmd.CommandText = """
-                    INSERT INTO chunks (document_id, page_number, chunk_index, text, embedding, y_start, y_end)
-                    VALUES (@doc_id, @page_number, @chunk_index, @text, @embedding, @y_start, @y_end);
+                    INSERT INTO chunks (document_id, page_number, chunk_index, text, embedding, y_start, y_end, tags)
+                    VALUES (@doc_id, @page_number, @chunk_index, @text, @embedding, @y_start, @y_end, @tags);
                     SELECT last_insert_rowid();
                     """;
                 cmd.Parameters.AddWithValue("@doc_id",      docId);
@@ -151,16 +160,18 @@ public class DocumentStore
                 cmd.Parameters.AddWithValue("@embedding",   FloatsToBytes(embeddings[i]));
                 cmd.Parameters.AddWithValue("@y_start",     chunks[i].YStart);
                 cmd.Parameters.AddWithValue("@y_end",       chunks[i].YEnd);
+                cmd.Parameters.AddWithValue("@tags",        tags);
                 chunkId = (long)(await cmd.ExecuteScalarAsync())!;
             }
 
-            // Populate FTS index
+            // Populate FTS index with both text content and NLP tags
             using (var cmd = conn.CreateCommand())
             {
                 cmd.Transaction = tx;
-                cmd.CommandText = "INSERT INTO chunks_fts(rowid, text) VALUES (@rowid, @text)";
+                cmd.CommandText = "INSERT INTO chunks_fts(rowid, text, tags) VALUES (@rowid, @text, @tags)";
                 cmd.Parameters.AddWithValue("@rowid", chunkId);
                 cmd.Parameters.AddWithValue("@text",  chunks[i].Text);
+                cmd.Parameters.AddWithValue("@tags",  tags);
                 await cmd.ExecuteNonQueryAsync();
             }
         }

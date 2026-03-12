@@ -89,22 +89,31 @@ public class OllamaService
             return left;
         }
 
-        // Single chunk still failing — truncate to ~6000 chars and retry once
-        var truncated = texts[0].Length > 6000 ? texts[0][..6000] : texts[0];
-        _logger.LogWarning("Single chunk embed failed, retrying with truncated text ({Len} chars)", truncated.Length);
-        try
+        // Single chunk still failing — cascade through progressively smaller truncations.
+        // Dense technical text (tables, measurements, formulas) tokenizes at 3-5 tokens/char,
+        // so a 4000-char chunk can easily exceed a 2048-token context window.
+        foreach (var limit in new[] { 3000, 2000, 1000, 400 })
         {
-            var payload  = new { model = _embedModel, input = truncated, keep_alive = "30m" };
-            var response = await _http.PostAsJsonAsync("/api/embed", payload, ct);
-            response.EnsureSuccessStatusCode();
-            var result = await response.Content.ReadFromJsonAsync<BatchEmbedResponse>(_jsonOptions, cancellationToken: ct);
-            return result?.Embeddings?.ToList() ?? [new float[0]];
+            var candidate = texts[0].Length > limit ? texts[0][..limit] : texts[0];
+            _logger.LogWarning("Single chunk embed failed — retrying with {Limit}-char truncation ({Len} chars)", limit, candidate.Length);
+            try
+            {
+                var payload  = new { model = _embedModel, input = candidate, keep_alive = "30m" };
+                var response = await _http.PostAsJsonAsync("/api/embed", payload, ct);
+                if (response.IsSuccessStatusCode)
+                {
+                    var result = await response.Content.ReadFromJsonAsync<BatchEmbedResponse>(_jsonOptions, cancellationToken: ct);
+                    if (result?.Embeddings is { Length: > 0 }) return result.Embeddings.ToList();
+                }
+            }
+            catch { /* try next limit */ }
+
+            // If the text was already shorter than this limit, no point trying smaller — just bail
+            if (texts[0].Length <= limit) break;
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Embed failed even after truncation — returning zero vector");
-            return [new float[384]]; // nomic-embed-text dimension; prevents ingestion abort
-        }
+
+        _logger.LogError("Embed failed at all truncation levels for chunk ({Len} chars) — using zero vector", texts[0].Length);
+        return [new float[384]]; // nomic-embed-text dimension; prevents ingestion from aborting
     }
 
     public async IAsyncEnumerable<string> StreamChatAsync(
@@ -149,64 +158,6 @@ public class OllamaService
 
             if (chunk?.Done == true) break;
         }
-    }
-
-    /// <summary>
-    /// Non-streaming call that asks the model to extract specific keyword terms from a query,
-    /// taking into account the current chat history and loaded document names.
-    /// Falls back gracefully to empty arrays on any failure.
-    /// </summary>
-    public async Task<KeywordResult> ExtractKeywordsAsync(
-        string query,
-        string chatHistory,
-        string documentNames,
-        CancellationToken ct = default)
-    {
-        var prompt = $$"""
-                       You are helping search a document database.
-                       Chat history: {{chatHistory}}
-                       Documents loaded: {{documentNames}}
-                       Current query: "{{query}}"
-
-                       Extract specific, technical, or rare search terms from the query considering the context above. Ignore common words.
-                       Return JSON only, no explanation: {"terms": ["term1", "term2"], "variants": ["variant1", "variant2"]}
-                       """;
-
-        var payload = new
-        {
-            model      = ActiveChatModel,
-            stream     = false,
-            keep_alive = "30m",
-            messages   = new[]
-            {
-                new { role = "user", content = prompt }
-            }
-        };
-
-        try
-        {
-            var response = await _http.PostAsJsonAsync("/api/chat", payload, ct);
-            response.EnsureSuccessStatusCode();
-
-            var result = await response.Content.ReadFromJsonAsync<NonStreamingChatResponse>(
-                _jsonOptions, cancellationToken: ct);
-            var content = result?.Message?.Content ?? "";
-
-            var jsonStart = content.IndexOf('{');
-            var jsonEnd = content.LastIndexOf('}');
-            if (jsonStart >= 0 && jsonEnd > jsonStart)
-            {
-                var json = content[jsonStart..(jsonEnd + 1)];
-                var kw = JsonSerializer.Deserialize<KeywordResult>(json, _jsonOptions);
-                if (kw != null) return kw;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Keyword extraction failed — falling back to embedding-only search");
-        }
-
-        return new KeywordResult([], []);
     }
 
     public async Task<bool> IsHealthyAsync(CancellationToken ct = default)
@@ -305,9 +256,6 @@ public class OllamaService
     private sealed record ChatStreamChunk(
         [property: JsonPropertyName("message")]  ChatMessage? Message,
         [property: JsonPropertyName("done")]     bool Done);
-
-    private sealed record NonStreamingChatResponse(
-        [property: JsonPropertyName("message")] ChatMessage? Message);
 
     private sealed record ChatMessage(
         [property: JsonPropertyName("role")]    string Role,

@@ -5,26 +5,24 @@ public class EmbeddingService
     private readonly OllamaService  _ollama;
     private readonly PdfService     _pdf;
     private readonly DocumentStore  _documentStore;
-    private readonly ChatSession    _chatSession;
     private readonly ILogger<EmbeddingService> _logger;
 
     public EmbeddingService(
         OllamaService  ollama,
         PdfService     pdf,
         DocumentStore  documentStore,
-        ChatSession    chatSession,
         ILogger<EmbeddingService> logger)
     {
         _ollama        = ollama;
         _pdf           = pdf;
         _documentStore = documentStore;
-        _chatSession   = chatSession;
         _logger        = logger;
     }
 
     /// <summary>
-    /// Parse, embed, and persist a PDF. Saves the original bytes so the viewer can serve it.
-    /// Reports progress 0–100 via the callback.
+    /// Parse, tag, embed, and persist a PDF.
+    /// NLP tagging runs in parallel (CPU-bound, thread-safe).
+    /// Embedding uses batched /api/embed calls.
     /// </summary>
     public async Task IngestAsync(
         byte[]      pdfBytes,
@@ -43,24 +41,35 @@ public class EmbeddingService
         if (chunks.Count == 0)
             throw new InvalidOperationException("No text could be extracted from this PDF.");
 
-        // 2. Embed chunks in batches (5 → 95 %)
-        // Sending all texts in one /api/embed call per batch eliminates per-chunk
-        // HTTP round-trips and model scheduling overhead.
+        onProgress(10);
+
+        // 2. NLP tagging — pure CPU work, run in parallel across all chunks
+        _logger.LogInformation("Tagging {N} chunks (parallel NLP)…", chunks.Count);
+        var chunkTags = await Task.Run(() =>
+            chunks
+                .AsParallel()
+                .AsOrdered()
+                .Select(c => NlpTagger.TagChunk(c.Text))
+                .ToList(), ct);
+
+        onProgress(20);
+
+        // 3. Embed chunks in batches (20 → 95 %)
         const int BatchSize = 32;
         var embeddings = new List<float[]>(chunks.Count);
         for (var i = 0; i < chunks.Count; i += BatchSize)
         {
             ct.ThrowIfCancellationRequested();
-            var batch      = chunks.Skip(i).Take(BatchSize).Select(c => c.Text).ToList();
-            var batchVecs  = await _ollama.GetEmbeddingsBatchAsync(batch, ct);
+            var batch     = chunks.Skip(i).Take(BatchSize).Select(c => c.Text).ToList();
+            var batchVecs = await _ollama.GetEmbeddingsBatchAsync(batch, ct);
             embeddings.AddRange(batchVecs);
-            onProgress(5 + (int)(Math.Min(i + BatchSize, chunks.Count) / (float)chunks.Count * 90));
+            onProgress(20 + (int)(Math.Min(i + BatchSize, chunks.Count) / (float)chunks.Count * 75));
         }
 
-        // 3. Persist chunks + FTS index
-        var docId = await _documentStore.AddDocumentAsync(fileName, chunks, embeddings);
+        // 4. Persist chunks + tags + FTS index
+        var docId = await _documentStore.AddDocumentAsync(fileName, chunks, embeddings, chunkTags);
 
-        // 4. Save original PDF bytes so the viewer can serve them
+        // 5. Save original PDF bytes so the viewer can serve them
         await _documentStore.SavePdfAsync(docId, pdfBytes);
 
         onProgress(100);
@@ -68,70 +77,39 @@ public class EmbeddingService
     }
 
     /// <summary>
-    /// Three-mode hybrid retrieval: FTS keyword search → cosine rerank.
-    /// Returns chunks with document ID and Y coordinates for the viewer.
+    /// Three-mode hybrid retrieval using NLP query expansion (no LLM warm-up).
     /// </summary>
     public async Task<List<RetrievedChunk>> RetrieveAsync(
         string query,
         int    topK = 6,
         CancellationToken ct = default)
     {
-        var documents     = await _documentStore.ListDocumentsAsync();
-        var documentNames = string.Join(", ", documents.Select(d => d.Filename));
-        var chatHistory   = _chatSession.FormatForPrompt(10);
-
-        var keywords = await _ollama.ExtractKeywordsAsync(query, chatHistory, documentNames, ct);
-
-        List<CandidateChunk> candidates;
-
-        if (keywords.Terms.Length > 0)
-        {
-            // Mode 1 — FTS keyword search (BM25-ranked)
-            candidates = await _documentStore.SearchByKeywordsAsync(keywords.Terms, keywords.Variants);
-
-            // Mode 2 — sparse: supplement with random sample
-            if (candidates.Count < 10)
-            {
-                _logger.LogDebug("FTS sparse ({N} hits), expanding with random sample", candidates.Count);
-                var sample      = await _documentStore.GetAllChunkSampleAsync(200);
-                var existingKeys = candidates.Select(c => (c.DocumentId, c.ChunkIndex)).ToHashSet();
-                candidates.AddRange(sample.Where(s => existingKeys.Add((s.DocumentId, s.ChunkIndex))));
-            }
-        }
-        else
-        {
-            // Mode 3 — no keywords: full random sample
-            _logger.LogDebug("No keywords extracted, using random sample");
-            candidates = await _documentStore.GetAllChunkSampleAsync(200);
-        }
-
-        if (candidates.Count == 0) return [];
-
-        var queryEmbedding = await _ollama.GetEmbeddingAsync(query, ct);
-        return _documentStore.RerankByEmbedding(queryEmbedding, candidates, topK);
+        var (chunks, _, _) = await RetrieveWithDebugAsync(query, topK, ct);
+        return chunks;
     }
 
     /// <summary>
-    /// Same as RetrieveAsync but also returns the keyword extraction result for debug output.
+    /// Same as RetrieveAsync but also returns keyword/tag info for the debug drawer.
     /// </summary>
     public async Task<(List<RetrievedChunk> Chunks, KeywordResult Keywords, int CandidateCount)> RetrieveWithDebugAsync(
         string query,
         int    topK = 6,
         CancellationToken ct = default)
     {
-        var documents     = await _documentStore.ListDocumentsAsync();
-        var documentNames = string.Join(", ", documents.Select(d => d.Filename));
-        var chatHistory   = _chatSession.FormatForPrompt(10);
-
-        var keywords = await _ollama.ExtractKeywordsAsync(query, chatHistory, documentNames, ct);
+        // NLP-based query expansion — instant, no LLM call
+        var keywords = NlpTagger.ExtractQueryTerms(query);
 
         List<CandidateChunk> candidates;
 
-        if (keywords.Terms.Length > 0)
+        if (keywords.Terms.Length > 0 || keywords.Variants.Length > 0)
         {
+            // Mode 1 — FTS5 search across text + tags columns (BM25-ranked)
             candidates = await _documentStore.SearchByKeywordsAsync(keywords.Terms, keywords.Variants);
+
+            // Mode 2 — sparse: supplement with a random sample when FTS hits are few
             if (candidates.Count < 10)
             {
+                _logger.LogDebug("FTS sparse ({N} hits), expanding with random sample", candidates.Count);
                 var sample       = await _documentStore.GetAllChunkSampleAsync(200);
                 var existingKeys = candidates.Select(c => (c.DocumentId, c.ChunkIndex)).ToHashSet();
                 candidates.AddRange(sample.Where(s => existingKeys.Add((s.DocumentId, s.ChunkIndex))));
@@ -139,6 +117,8 @@ public class EmbeddingService
         }
         else
         {
+            // Mode 3 — no extractable terms: full random sample
+            _logger.LogDebug("No NLP terms extracted, using random sample");
             candidates = await _documentStore.GetAllChunkSampleAsync(200);
         }
 
